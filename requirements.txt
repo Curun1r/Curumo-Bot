@@ -1,0 +1,16 @@
+# Discord API wrapper. Extra "voice" pulls in PyNaCl for voice-channel support.
+discord.py[voice]>=2.3.0
+
+# Resolves search queries / links into playable audio stream URLs.
+yt-dlp>=2024.1.0
+
+# Required by discord.py for voice encryption (also covered by [voice], listed
+# explicitly so `pip install -r requirements.txt` works even if extras are stripped).
+PyNaCl>=1.5.0
+
+# Loads the bot token and other settings from a local .env file.
+python-dotenv>=1.0.0
+
+# HTTP calls to the Spotify Web API, used to resolve open.spotify.com links
+# into searchable track titles/artists (Spotify itself can't be streamed from).
+requests>=2.31.0
