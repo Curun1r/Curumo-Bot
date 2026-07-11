@@ -37,8 +37,28 @@ class MusicCog(commands.Cog):
     def get_player(self, guild: discord.Guild) -> Player:
         """Returns the Player for a server, creating a new one if it doesn't exist yet."""
         if guild.id not in self.players:
-            self.players[guild.id] = Player(guild)
+            player = Player(guild)
+            # Player handles the idle timeout itself but stays silent about
+            # it (it never talks to text channels) — the notification is
+            # this cog's job, wired in via callback.
+            player.on_idle_disconnect = self._make_idle_notifier(player)
+            self.players[guild.id] = player
         return self.players[guild.id]
+
+    @staticmethod
+    def _make_idle_notifier(player: Player):
+        """Builds the callback that notifies the last used text channel about an idle disconnect."""
+
+        async def notify() -> None:
+            if player.text_channel is None:
+                return
+            await player.text_channel.send(
+                embed=embeds.success_embed(
+                    "👋 Вийшов з голосового каналу через неактивність."
+                )
+            )
+
+        return notify
 
     # ------------------------------------------------------------------ #
     # /play

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import discord
 
@@ -68,6 +68,16 @@ class Player:
         # empty and try to start playback in parallel.
         self._enqueue_lock = asyncio.Lock()
 
+        # Idle auto-disconnect. The timer starts whenever the player is
+        # connected but has nothing to play (right after join(), when the
+        # queue runs out, or after /stop) and is cancelled as soon as a
+        # track starts. When it fires, the player disconnects and calls
+        # on_idle_disconnect (set by the cog) so the notification message
+        # stays in the cogs/ layer — Player itself never talks to Discord
+        # text channels.
+        self._idle_task: Optional[asyncio.Task] = None
+        self.on_idle_disconnect: Optional[Callable[[], Awaitable[None]]] = None
+
     # ------------------------------------------------------------------ #
     # State
     # ------------------------------------------------------------------ #
@@ -95,8 +105,15 @@ class Player:
         else:
             self.voice_client = await channel.connect()
 
+        # If nothing gets enqueued after joining (e.g. the search failed),
+        # don't sit in the channel forever — the timer is cancelled by
+        # _start_playing() as soon as a track actually starts.
+        self._start_idle_timer()
+
     async def disconnect(self) -> None:
         """Disconnects from voice and fully resets the player state (queue, current track, etc.)."""
+        self._cancel_idle_timer()
+
         if self.voice_client:
             await self.voice_client.disconnect(force=True)
 
@@ -144,6 +161,7 @@ class Player:
 
         self.voice_client.play(source, after=self._after_playback)
         self._is_paused = False
+        self._cancel_idle_timer()
 
         logger.info("[%s] Now playing: %s", self.guild.name, track.title)
 
@@ -169,6 +187,7 @@ class Player:
         if next_track is None:
             self.current = None
             logger.info("[%s] Queue is empty — playback finished.", self.guild.name)
+            self._start_idle_timer()
             return
 
         self.current = next_track
@@ -216,6 +235,11 @@ class Player:
 
         if self.is_connected:
             self.voice_client.stop()
+            # Nothing left to play — start counting down to auto-disconnect.
+            # (voice_client.stop() will still fire _after_playback -> _advance,
+            # which restarts the timer, but starting it here as well covers
+            # the case where nothing was playing when /stop was used.)
+            self._start_idle_timer()
 
     def set_volume(self, volume: float) -> float:
         """
@@ -233,3 +257,49 @@ class Player:
             self.voice_client.source.volume = self.volume
 
         return self.volume
+
+    # ------------------------------------------------------------------ #
+    # Idle auto-disconnect
+    # ------------------------------------------------------------------ #
+
+    def _start_idle_timer(self) -> None:
+        """(Re)starts the inactivity countdown. A timeout of 0 disables the feature."""
+        if config.INACTIVITY_TIMEOUT <= 0:
+            return
+
+        self._cancel_idle_timer()
+        self._idle_task = self.loop.create_task(self._idle_disconnect())
+
+    def _cancel_idle_timer(self) -> None:
+        """Cancels a pending inactivity countdown, if any."""
+        # Never cancel ourselves: _idle_disconnect() calls disconnect(),
+        # which calls this method — cancelling the current task here would
+        # kill the disconnect midway.
+        if self._idle_task and self._idle_task is not asyncio.current_task():
+            self._idle_task.cancel()
+        self._idle_task = None
+
+    async def _idle_disconnect(self) -> None:
+        """Waits INACTIVITY_TIMEOUT seconds and disconnects if still idle."""
+        try:
+            await asyncio.sleep(config.INACTIVITY_TIMEOUT)
+        except asyncio.CancelledError:
+            return  # a track started (or manual disconnect) — abort silently
+
+        # Double-check the state: pause counts as activity (a user
+        # explicitly paused and probably intends to come back).
+        if not self.is_connected or self.is_playing or self.is_paused:
+            return
+
+        logger.info(
+            "[%s] Idle for %d seconds — auto-disconnecting.",
+            self.guild.name,
+            config.INACTIVITY_TIMEOUT,
+        )
+        await self.disconnect()
+
+        if self.on_idle_disconnect is not None:
+            try:
+                await self.on_idle_disconnect()
+            except Exception:  # noqa: BLE001 — a failed notification must not crash the loop
+                logger.exception("[%s] on_idle_disconnect callback failed", self.guild.name)
