@@ -95,6 +95,11 @@ class Player:
         self._idle_task: Optional[asyncio.Task] = None
         self.on_idle_disconnect: Optional[Callable[[], Awaitable[None]]] = None
 
+        # True while WE are disconnecting on purpose (disconnect(), idle
+        # timeout). Lets handle_external_disconnect() tell an intentional
+        # leave apart from a dropped connection or a kick.
+        self._expected_disconnect = False
+
     # ------------------------------------------------------------------ #
     # State
     # ------------------------------------------------------------------ #
@@ -132,12 +137,71 @@ class Player:
         self._cancel_idle_timer()
 
         if self.voice_client:
+            if self.voice_client.is_connected():
+                # Mark the upcoming voice_state_update as ours so the
+                # external-disconnect handler doesn't try to reconnect.
+                self._expected_disconnect = True
             await self.voice_client.disconnect(force=True)
 
         self.voice_client = None
         self.current = None
         self._is_paused = False
         self.queue.clear()
+
+    async def handle_external_disconnect(self, channel: discord.VoiceChannel) -> None:
+        """
+        Called by the cog (via on_voice_state_update) when the bot left a
+        voice channel WITHOUT us asking — a network drop, a voice server
+        outage, or an admin kick.
+
+        Strategy: give discord.py's built-in reconnect a moment to recover;
+        if it didn't and there was something to play, try to rejoin the
+        channel ourselves and restart the interrupted track. If nothing was
+        playing (or reconnecting fails), just reset the state so the player
+        isn't left half-broken.
+        """
+        if self._expected_disconnect:
+            self._expected_disconnect = False
+            return
+
+        # discord.py's VoiceClient has its own reconnect logic for network
+        # blips — don't fight it, check back after a short grace period.
+        await asyncio.sleep(5)
+        if self.is_connected:
+            return
+
+        interrupted = self.current
+
+        if interrupted is None and not self.queue:
+            # Nothing was playing anyway — quietly reset and move on.
+            logger.info("[%s] Externally disconnected while idle — resetting state.", self.guild.name)
+            await self.disconnect()
+            return
+
+        logger.warning("[%s] Voice connection lost — attempting to reconnect.", self.guild.name)
+        self.voice_client = None
+
+        for attempt in (1, 2):
+            try:
+                self.voice_client = await channel.connect()
+                break
+            except discord.DiscordException as exc:
+                logger.warning(
+                    "[%s] Reconnect attempt %d failed: %s", self.guild.name, attempt, exc
+                )
+                await asyncio.sleep(2 * attempt)
+
+        if not self.is_connected:
+            logger.error("[%s] Could not reconnect — giving up and resetting state.", self.guild.name)
+            await self.disconnect()
+            return
+
+        logger.info("[%s] Reconnected to voice.", self.guild.name)
+        if interrupted is not None:
+            # Position within the track is lost (the FFmpeg stream died with
+            # the connection), so the track restarts from the beginning.
+            self.current = interrupted
+            await self._start_playing(interrupted)
 
     # ------------------------------------------------------------------ #
     # Playback
@@ -220,6 +284,12 @@ class Player:
         the user explicitly skipped it), QUEUE re-appends the finished track
         to the back of the queue before taking the next one.
         """
+        if not self.is_connected:
+            # The stream died because the voice connection itself dropped.
+            # Leave current/queue untouched — handle_external_disconnect()
+            # decides whether to reconnect and resume or to reset the state.
+            return
+
         skip_requested = self._skip_requested
         self._skip_requested = False
 

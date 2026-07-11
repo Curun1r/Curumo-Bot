@@ -43,6 +43,31 @@ class TrackNotFoundError(Exception):
     """Raised when no track could be found or processed for the given query."""
 
 
+def _friendly_error_message(exc: Exception, query: str) -> str:
+    """
+    Maps well-known yt-dlp failure reasons (private video, age restriction,
+    region block, an upcoming premiere...) to short user-friendly messages.
+
+    yt-dlp only exposes the reason as free-form text inside DownloadError,
+    so substring matching against the lowercased message is the accepted
+    way to tell these cases apart.
+    """
+    text = str(exc).lower()
+
+    if "private video" in text:
+        return "Це відео приватне — відтворити його неможливо."
+    if "age" in text and ("sign in" in text or "restrict" in text):
+        return "Це відео має вікове обмеження — відтворити його неможливо."
+    if "premieres in" in text or "live event will begin" in text:
+        return "Ця трансляція ще не почалася — спробуй пізніше."
+    if "not a bot" in text:
+        return "YouTube тимчасово блокує запити з цього сервера. Спробуй за кілька хвилин."
+    if "video unavailable" in text or "video is not available" in text or "removed" in text:
+        return "Це відео недоступне (видалене або заблоковане в регіоні сервера)."
+
+    return f"Не вдалося обробити запит: {query!r}"
+
+
 class SearchResult:
     """
     A compact search result — only what's needed to later build a
@@ -108,11 +133,17 @@ def _to_search_result(info: dict[str, Any]) -> SearchResult:
     if not stream_url:
         raise TrackNotFoundError("Не вдалося отримати посилання на аудіопотік для цього треку.")
 
+    # Live streams: playable (FFmpeg handles HLS), but duration must be None
+    # so the rest of the code treats them correctly — /queue and /nowplaying
+    # show "LIVE", and Player.seek() refuses to seek them. yt-dlp sometimes
+    # reports a bogus duration for live content, so is_live wins over it.
+    is_live = bool(info.get("is_live"))
+
     return SearchResult(
         title=info.get("title") or "Без назви",
         webpage_url=info.get("webpage_url") or info.get("original_url") or "",
         stream_url=stream_url,
-        duration=info.get("duration"),
+        duration=None if is_live else info.get("duration"),
         thumbnail=info.get("thumbnail"),
         uploader=info.get("uploader"),
     )
@@ -138,6 +169,6 @@ async def search(query: str, *, loop: Optional[asyncio.AbstractEventLoop] = None
         info = await loop.run_in_executor(None, extractor)
     except yt_dlp.utils.DownloadError as exc:
         logger.warning("yt-dlp failed to process query %r: %s", query, exc)
-        raise TrackNotFoundError(f"Не вдалося обробити запит: {query!r}") from exc
+        raise TrackNotFoundError(_friendly_error_message(exc, query)) from exc
 
     return _to_search_result(info)

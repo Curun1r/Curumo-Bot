@@ -89,6 +89,31 @@ class MusicCog(commands.Cog):
         return notify
 
     # ------------------------------------------------------------------ #
+    # Voice connection watchdog
+    # ------------------------------------------------------------------ #
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """
+        Watches for the BOT itself leaving a voice channel (network drop,
+        voice server outage, admin kick) and hands recovery over to the
+        player. Intentional disconnects are filtered out inside
+        Player.handle_external_disconnect().
+        """
+        if member.id != self.bot.user.id:
+            return
+
+        if before.channel is not None and after.channel is None:
+            player = self.players.get(member.guild.id)
+            if player is not None:
+                await player.handle_external_disconnect(before.channel)
+
+    # ------------------------------------------------------------------ #
     # /play
     # ------------------------------------------------------------------ #
 
@@ -129,12 +154,16 @@ class MusicCog(commands.Cog):
 
         added: list[tuple[Track, int]] = []
         failed = 0
+        last_error: str | None = None
 
         for single_query in queries:
             try:
                 result = await search(single_query)
-            except TrackNotFoundError:
+            except TrackNotFoundError as exc:
+                # Keep the specific reason (private video, age restriction,
+                # region block...) so a single failed query can show it.
                 failed += 1
+                last_error = str(exc)
                 continue
 
             track = Track(
@@ -156,9 +185,14 @@ class MusicCog(commands.Cog):
             added.append((track, position))
 
         if not added:
-            await interaction.followup.send(
-                embed=embeds.error_embed("Не вдалося знайти жодного треку за цим запитом.")
+            # For a single query show the specific reason; for a batch
+            # (Spotify playlist) a generic summary is more useful.
+            message = (
+                last_error
+                if len(queries) == 1 and last_error
+                else "Не вдалося знайти жодного треку за цим запитом."
             )
+            await interaction.followup.send(embed=embeds.error_embed(message))
             return
 
         if len(added) == 1:
