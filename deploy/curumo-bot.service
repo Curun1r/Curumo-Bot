@@ -1,0 +1,27 @@
+# systemd unit file for running Curumo_bot as a background service on a VPS.
+#
+# Install:
+#   sudo cp deploy/curumo-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now curumo-bot
+#
+# Logs:
+#   journalctl -u curumo-bot -f
+#
+# Adjust User/WorkingDirectory/ExecStart below to match where you deployed the bot.
+
+[Unit]
+Description=Curumo_bot Discord music bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=curumo
+WorkingDirectory=/opt/curumo-bot
+ExecStart=/opt/curumo-bot/venv/bin/python bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
