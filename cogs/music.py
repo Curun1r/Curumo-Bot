@@ -16,13 +16,41 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from core.player import Player, PlayerError
+from core.player import LoopMode, Player, PlayerError
 from core.queue import Track
 from core.search import TrackNotFoundError, search
 from core.spotify import SpotifyError, is_spotify_url, resolve as resolve_spotify
 from utils import checks, embeds
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_timestamp(value: str) -> int:
+    """
+    Parses a user-entered position into seconds.
+
+    Accepts plain seconds ("90") or colon-separated timestamps ("1:30",
+    "1:02:15"). Raises ValueError for anything else.
+    """
+    parts = value.strip().split(":")
+    if not 1 <= len(parts) <= 3:
+        raise ValueError(f"Invalid timestamp: {value!r}")
+
+    seconds = 0
+    for part in parts:
+        if not part.isdigit():
+            raise ValueError(f"Invalid timestamp: {value!r}")
+        seconds = seconds * 60 + int(part)
+    return seconds
+
+
+def _format_timestamp(seconds: int) -> str:
+    """Formats seconds as 'M:SS' / 'H:MM:SS' (mirrors Track.formatted_duration)."""
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
 
 class MusicCog(commands.Cog):
@@ -190,6 +218,106 @@ class MusicCog(commands.Cog):
         await player.stop()
         await interaction.response.send_message(
             embed=embeds.success_embed("⏹️ Відтворення зупинено, черга очищена.")
+        )
+
+    # ------------------------------------------------------------------ #
+    # /seek /shuffle /remove /loop
+    # ------------------------------------------------------------------ #
+
+    @app_commands.command(name="seek", description="Перемотати поточний трек на вказану позицію")
+    @app_commands.describe(position="Позиція: секунди (90) або час (1:30, 1:02:15)")
+    @app_commands.guild_only()
+    @checks.same_voice_channel()
+    async def seek(self, interaction: discord.Interaction, position: str) -> None:
+        player = self.get_player(interaction.guild)
+
+        try:
+            seconds = _parse_timestamp(position)
+        except ValueError:
+            await interaction.response.send_message(
+                embed=embeds.error_embed(
+                    "Невірний формат позиції. Приклади: `90`, `1:30`, `1:02:15`."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await player.seek(seconds)
+        except PlayerError as exc:
+            await interaction.response.send_message(
+                embed=embeds.error_embed(str(exc)), ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            embed=embeds.success_embed(f"⏩ Перемотано на **{_format_timestamp(seconds)}**.")
+        )
+
+    @app_commands.command(name="shuffle", description="Перемішати чергу треків")
+    @app_commands.guild_only()
+    @checks.same_voice_channel()
+    async def shuffle(self, interaction: discord.Interaction) -> None:
+        player = self.get_player(interaction.guild)
+
+        if len(player.queue) < 2:
+            await interaction.response.send_message(
+                embed=embeds.error_embed("У черзі замало треків, щоб їх перемішувати."),
+                ephemeral=True,
+            )
+            return
+
+        player.queue.shuffle()
+        await interaction.response.send_message(
+            embed=embeds.success_embed(f"🔀 Чергу перемішано ({len(player.queue)} трек(ів)).")
+        )
+
+    @app_commands.command(name="remove", description="Видалити трек із черги за номером")
+    @app_commands.describe(position="Номер треку в черзі (див. /queue)")
+    @app_commands.guild_only()
+    @checks.same_voice_channel()
+    async def remove(
+        self,
+        interaction: discord.Interaction,
+        position: app_commands.Range[int, 1],
+    ) -> None:
+        player = self.get_player(interaction.guild)
+
+        # /queue shows tracks numbered from 1, MusicQueue indexes from 0.
+        track = player.queue.remove(position - 1)
+
+        if track is None:
+            await interaction.response.send_message(
+                embed=embeds.error_embed(f"У черзі немає треку з номером {position}."),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            embed=embeds.success_embed(f"🗑️ Видалено з черги: **{track.title}**.")
+        )
+
+    @app_commands.command(name="loop", description="Режим повторення: вимкнено / трек / черга")
+    @app_commands.describe(mode="Що повторювати")
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="Вимкнено", value="off"),
+            app_commands.Choice(name="Поточний трек", value="track"),
+            app_commands.Choice(name="Уся черга", value="queue"),
+        ]
+    )
+    @app_commands.guild_only()
+    @checks.same_voice_channel()
+    async def loop(
+        self,
+        interaction: discord.Interaction,
+        mode: app_commands.Choice[str],
+    ) -> None:
+        player = self.get_player(interaction.guild)
+        player.loop_mode = LoopMode(mode.value)
+
+        await interaction.response.send_message(
+            embed=embeds.success_embed(f"🔁 Повторення: **{mode.name}**.")
         )
 
     # ------------------------------------------------------------------ #

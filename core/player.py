@@ -16,18 +16,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from enum import Enum
 from typing import Awaitable, Callable, Optional
 
 import discord
 
 import config
-from core.queue import MusicQueue, Track
+from core.queue import MusicQueue, QueueFullError, Track
 
 logger = logging.getLogger(__name__)
 
 
 class PlayerError(Exception):
     """A player-level error (e.g. trying to play without a voice connection)."""
+
+
+class LoopMode(Enum):
+    """Repeat behaviour applied when a track finishes (see Player._advance)."""
+
+    OFF = "off"        # normal queue consumption
+    TRACK = "track"    # replay the current track forever (until /skip or /loop off)
+    QUEUE = "queue"    # finished tracks go to the back of the queue
 
 
 class Player:
@@ -62,6 +71,14 @@ class Player:
 
         self.volume: float = config.DEFAULT_VOLUME
         self._is_paused = False
+
+        self.loop_mode: LoopMode = LoopMode.OFF
+        # /skip must always move to the next track, even in TRACK loop mode —
+        # this flag lets _advance() tell a natural track end from a skip.
+        self._skip_requested = False
+        # Set before an intentional voice_client.stop() that should NOT
+        # advance the queue (e.g. /seek restarts FFmpeg on the same track).
+        self._suppress_advance = False
 
         # Guards enqueue against a race condition: two /play commands
         # arriving almost simultaneously shouldn't both decide the queue is
@@ -144,14 +161,24 @@ class Player:
             self.queue.add(track)
             return len(self.queue)
 
-    async def _start_playing(self, track: Track) -> None:
-        """Builds an audio source from the stream link and starts it via FFmpeg in Opus format."""
+    async def _start_playing(self, track: Track, *, seek: int = 0) -> None:
+        """Builds an audio source from the stream link and starts it via FFmpeg in Opus format.
+
+        seek — start position in seconds. Passed to FFmpeg as `-ss` BEFORE
+        the input, which makes FFmpeg ask the HTTP server for the right
+        byte range instead of downloading and discarding audio (fast input
+        seeking). 0 means "play from the beginning".
+        """
         if not self.is_connected:
             raise PlayerError("Бот не підключений до голосового каналу.")
 
+        before_options = config.FFMPEG_BEFORE_OPTIONS
+        if seek > 0:
+            before_options = f"-ss {seek} {before_options}"
+
         source: discord.AudioSource = discord.FFmpegPCMAudio(
             track.stream_url,
-            before_options=config.FFMPEG_BEFORE_OPTIONS,
+            before_options=before_options,
             options=config.FFMPEG_OPTIONS,
         )
         # PCMVolumeTransformer wraps the source and allows changing the
@@ -178,10 +205,41 @@ class Player:
         if error:
             logger.error("[%s] Playback error: %s", self.guild.name, error)
 
+        # A deliberate restart of the same track (e.g. /seek) — the queue
+        # must not advance. The flag is one-shot: consume it and bail out.
+        if self._suppress_advance:
+            self._suppress_advance = False
+            return
+
         asyncio.run_coroutine_threadsafe(self._advance(), self.loop)
 
     async def _advance(self) -> None:
-        """Switches to the next track in the queue, or stops if the queue is exhausted."""
+        """Switches to the next track in the queue, or stops if the queue is exhausted.
+
+        Also implements loop modes: TRACK replays the current track (unless
+        the user explicitly skipped it), QUEUE re-appends the finished track
+        to the back of the queue before taking the next one.
+        """
+        skip_requested = self._skip_requested
+        self._skip_requested = False
+
+        if self.current is not None:
+            if self.loop_mode is LoopMode.TRACK and not skip_requested:
+                await self._start_playing(self.current)
+                return
+
+            if self.loop_mode is LoopMode.QUEUE:
+                try:
+                    self.queue.add(self.current)
+                except QueueFullError:
+                    # The queue hit its limit while the track was playing —
+                    # drop the finished track instead of crashing the loop.
+                    logger.warning(
+                        "[%s] Queue full — dropping %r from QUEUE loop.",
+                        self.guild.name,
+                        self.current.title,
+                    )
+
         next_track = self.queue.pop_next()
 
         if next_track is None:
@@ -223,9 +281,35 @@ class Player:
         shouldn't be, to avoid advancing the queue twice).
         """
         if self.is_playing or self.is_paused:
+            # Mark this as an explicit skip so TRACK loop mode doesn't
+            # immediately replay the track the user is trying to get rid of.
+            self._skip_requested = True
             self.voice_client.stop()
             return True
         return False
+
+    async def seek(self, position: int) -> None:
+        """
+        Jumps to `position` seconds in the current track by restarting the
+        FFmpeg stream with an `-ss` offset (Discord voice can't seek an
+        already-running stream).
+        """
+        if self.current is None or not (self.is_playing or self.is_paused):
+            raise PlayerError("Зараз нічого не грає.")
+
+        if self.current.duration is None:
+            raise PlayerError("Перемотування недоступне для живих трансляцій.")
+
+        if not 0 <= position < self.current.duration:
+            raise PlayerError(
+                f"Позиція поза межами треку (тривалість: {self.current.formatted_duration})."
+            )
+
+        # stop() below fires _after_playback from discord.py's thread —
+        # the flag tells it to NOT advance the queue this one time.
+        self._suppress_advance = True
+        self.voice_client.stop()
+        await self._start_playing(self.current, seek=position)
 
     async def stop(self) -> None:
         """Fully stops playback and clears the queue, but does NOT leave the voice channel."""
